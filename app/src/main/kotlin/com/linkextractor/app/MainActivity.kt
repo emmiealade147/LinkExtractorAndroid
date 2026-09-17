@@ -250,8 +250,9 @@ class MainActivity : ComponentActivity() {
     }
 
 
-    @Composable
-    private fun AppUi() {
+    @OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppUi() {
 
         MaterialTheme {
 
