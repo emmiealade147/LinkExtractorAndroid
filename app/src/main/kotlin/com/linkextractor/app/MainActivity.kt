@@ -1,14 +1,20 @@
 package com.linkextractor.app
 
+import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.os.Bundle
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -40,41 +46,27 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
-import androidx.lifecycle.lifecycleScope
-
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-
-import okhttp3.OkHttpClient
-import okhttp3.Request
-
-import org.jsoup.Jsoup
-
-import java.net.URI
-
 
 class MainActivity : ComponentActivity() {
 
-    private val client = OkHttpClient()
+    private var webView: WebView? = null
 
     private val links = mutableStateListOf<String>()
 
     private var sourceUrl by mutableStateOf("")
 
     private var status by mutableStateOf(
-        "Share a webpage from Chrome or another browser."
+        "Enter a webpage URL."
     )
-
-    private var loading by mutableStateOf(false)
 
     private var filter by mutableStateOf("")
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
+
         super.onCreate(savedInstanceState)
 
-        handleIntent(intent)
+        sourceUrl = getSharedUrl(intent) ?: ""
 
         setContent {
             AppUi()
@@ -83,136 +75,239 @@ class MainActivity : ComponentActivity() {
 
 
     override fun onNewIntent(intent: Intent) {
+
         super.onNewIntent(intent)
 
-        handleIntent(intent)
-    }
+        val url = getSharedUrl(intent)
 
+        if (!url.isNullOrBlank()) {
 
-    private fun handleIntent(intent: Intent?) {
+            sourceUrl = url
 
-        val text = intent?.getStringExtra(Intent.EXTRA_TEXT)
-
-        val uri = intent?.data
-
-        val candidate = uri?.toString() ?: text
-
-        if (!candidate.isNullOrBlank()) {
-
-            val url = Regex(
-                """https?://[^\s]+"""
-            )
-                .find(candidate)
-                ?.value
-                ?.trimEnd('.', ',', ')', ']', ';')
-
-
-            if (url != null) {
-
-                sourceUrl = url
-
-                extract(url)
-            }
+            loadPage(url)
         }
     }
 
 
-    private fun extract(url: String) {
+    private fun getSharedUrl(intent: Intent?): String? {
 
-        loading = true
+        if (intent == null) return null
 
-        status = "Extracting links..."
+        val sharedText =
+            intent.getStringExtra(Intent.EXTRA_TEXT)
+
+        val sharedUrl =
+            intent.data?.toString()
+
+        val candidate =
+            sharedUrl ?: sharedText
+
+        if (candidate.isNullOrBlank()) {
+            return null
+        }
+
+        return Regex(
+            """https?://[^\s]+"""
+        )
+            .find(candidate)
+            ?.value
+            ?.trimEnd('.', ',', ')', ']', ';')
+            ?: if (
+                candidate.startsWith("http://") ||
+                candidate.startsWith("https://")
+            ) {
+                candidate
+            } else {
+                null
+            }
+    }
 
 
-        lifecycleScope.launch(Dispatchers.IO) {
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun loadPage(url: String) {
 
-            try {
+        status = "Loading webpage..."
 
-                val request = Request.Builder()
-                    .url(url)
-                    .header(
-                        "User-Agent",
-                        "Mozilla/5.0 (Android) LinkExtractor/1.0"
-                    )
-                    .build()
+        links.clear()
 
+        webView?.let { browser ->
 
-                client.newCall(request).execute().use { response ->
+            browser.loadUrl(url)
 
-                    if (!response.isSuccessful) {
-
-                        error("HTTP ${response.code}")
-                    }
+            return
+        }
 
 
-                    val html = response.body?.string() ?: ""
+        val browser = WebView(this)
+
+        webView = browser
+
+        browser.settings.apply {
+
+            javaScriptEnabled = true
+
+            domStorageEnabled = true
+
+            databaseEnabled = true
+
+            loadsImagesAutomatically = true
+
+            mixedContentMode =
+                WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+
+            userAgentString =
+                "Mozilla/5.0 (Linux; Android 12) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/140.0.0.0 Mobile Safari/537.36"
+        }
 
 
-                    val document = Jsoup.parse(
-                        html,
+        browser.webViewClient =
+            object : WebViewClient() {
+
+                override fun onPageFinished(
+                    view: WebView?,
+                    url: String?
+                ) {
+
+                    super.onPageFinished(
+                        view,
                         url
                     )
 
-
-                    val found = linkedSetOf<String>()
-
-
-                    document
-                        .select("a[href]")
-                        .forEach { element ->
-
-                            val href = element
-                                .attr("abs:href")
-                                .trim()
-
-
-                            if (isValidHttpUrl(href)) {
-
-                                found.add(href)
-                            }
-                        }
-
-
-                    withContext(Dispatchers.Main) {
-
-                        links.clear()
-
-                        links.addAll(found)
-
-                        status =
-                            "${links.size} unique valid HTTP(S) links found."
-
-                        loading = false
-                    }
-                }
-
-            } catch (e: Exception) {
-
-                withContext(Dispatchers.Main) {
-
-                    loading = false
-
                     status =
-                        "Could not extract links: ${
-                            e.message ?: "Unknown error"
-                        }"
+                        "Page loaded. Scanning links..."
+
+                    extractRenderedLinks()
                 }
             }
+
+
+        browser.webChromeClient =
+            WebChromeClient()
+
+
+        browser.addJavascriptInterface(
+            LinkBridge(),
+            "AndroidLinkExtractor"
+        )
+
+
+        browser.loadUrl(url)
+    }
+
+
+    private fun extractRenderedLinks() {
+
+        val script = """
+            (function() {
+
+                const links = [];
+
+                const anchors =
+                    document.querySelectorAll('a[href]');
+
+                anchors.forEach(function(a) {
+
+                    try {
+
+                        const url =
+                            new URL(
+                                a.href,
+                                document.baseURI
+                            ).href;
+
+                        links.push(url);
+
+                    } catch (e) {
+                    }
+                });
+
+                return JSON.stringify(links);
+
+            })();
+        """.trimIndent()
+
+
+        webView?.evaluateJavascript(
+            script
+        ) { result ->
+
+            val decoded =
+                result
+                    .removePrefix("\"")
+                    .removeSuffix("\"")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+
+            processJavascriptLinks(decoded)
         }
     }
 
 
-    private fun isValidHttpUrl(value: String): Boolean {
+    private fun processJavascriptLinks(json: String) {
+
+        try {
+
+            val cleaned =
+                json
+                    .removePrefix("[")
+                    .removeSuffix("]")
+
+
+            val found =
+                cleaned
+                    .split("\",\"")
+                    .map {
+
+                        it
+                            .trim()
+                            .trim('"')
+                            .replace("\\/", "/")
+                    }
+                    .filter {
+
+                        isValidHttpUrl(it)
+                    }
+                    .distinct()
+
+
+            links.clear()
+
+            links.addAll(found)
+
+
+            status =
+                "${links.size} unique HTTP(S) links found."
+
+        } catch (e: Exception) {
+
+            status =
+                "Could not process page links."
+        }
+    }
+
+
+    private fun isValidHttpUrl(
+        value: String
+    ): Boolean {
 
         return try {
 
-            val uri = URI(value)
+            val uri =
+                java.net.URI(value)
 
             (
-                uri.scheme.equals("http", true) ||
-                uri.scheme.equals("https", true)
+                uri.scheme.equals(
+                    "http",
+                    true
+                ) ||
+                uri.scheme.equals(
+                    "https",
+                    true
+                )
             ) &&
-                    !uri.host.isNullOrBlank()
+                !uri.host.isNullOrBlank()
 
         } catch (_: Exception) {
 
@@ -223,11 +318,15 @@ class MainActivity : ComponentActivity() {
 
     private fun copyAll() {
 
-        val visible = links.filter {
+        val visible =
+            links.filter {
 
-            filter.isBlank() ||
-                    it.contains(filter, true)
-        }
+                filter.isBlank() ||
+                    it.contains(
+                        filter,
+                        true
+                    )
+            }
 
 
         val clipboard =
@@ -246,13 +345,29 @@ class MainActivity : ComponentActivity() {
 
 
         status =
-            "${visible.size} links copied to clipboard."
+            "${visible.size} links copied."
+    }
+
+
+    private inner class LinkBridge {
+
+        @JavascriptInterface
+        fun receiveLinks(
+            value: String
+        ) {
+            runOnUiThread {
+
+                processJavascriptLinks(
+                    value
+                )
+            }
+        }
     }
 
 
     @OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun AppUi() {
+    @Composable
+    private fun AppUi() {
 
         MaterialTheme {
 
@@ -263,14 +378,14 @@ private fun AppUi() {
                     TopAppBar(
 
                         title = {
-
-                            Text("Link Extractor")
+                            Text(
+                                "Link Extractor"
+                            )
                         }
                     )
                 }
 
             ) { padding ->
-
 
                 Column(
 
@@ -280,17 +395,19 @@ private fun AppUi() {
                         .padding(16.dp)
                 ) {
 
-
                     OutlinedTextField(
 
-                        value = sourceUrl,
+                        value =
+                            sourceUrl,
 
                         onValueChange = {
                             sourceUrl = it
                         },
 
                         label = {
-                            Text("Webpage URL")
+                            Text(
+                                "Webpage URL"
+                            )
                         },
 
                         singleLine = true,
@@ -313,7 +430,6 @@ private fun AppUi() {
                             Arrangement.spacedBy(8.dp)
                     ) {
 
-
                         Button(
 
                             onClick = {
@@ -324,20 +440,33 @@ private fun AppUi() {
                                     )
                                 ) {
 
-                                    extract(sourceUrl)
+                                    loadPage(
+                                        sourceUrl
+                                    )
                                 }
-                            },
-
-                            enabled = !loading
+                            }
 
                         ) {
 
                             Text(
+                                "Open & Extract"
+                            )
+                        }
 
-                                if (loading)
-                                    "Working..."
-                                else
-                                    "Extract"
+
+                        OutlinedButton(
+
+                            onClick = {
+                                extractRenderedLinks()
+                            },
+
+                            enabled =
+                                webView != null
+
+                        ) {
+
+                            Text(
+                                "Scan Again"
                             )
                         }
 
@@ -348,11 +477,14 @@ private fun AppUi() {
                                 copyAll()
                             },
 
-                            enabled = links.isNotEmpty()
+                            enabled =
+                                links.isNotEmpty()
 
                         ) {
 
-                            Text("Copy All")
+                            Text(
+                                "Copy All"
+                            )
                         }
                     }
 
@@ -364,14 +496,17 @@ private fun AppUi() {
 
                     OutlinedTextField(
 
-                        value = filter,
+                        value =
+                            filter,
 
                         onValueChange = {
                             filter = it
                         },
 
                         label = {
-                            Text("Filter links")
+                            Text(
+                                "Filter links"
+                            )
                         },
 
                         singleLine = true,
@@ -404,10 +539,10 @@ private fun AppUi() {
                         links.filter {
 
                             filter.isBlank() ||
-                                    it.contains(
-                                        filter,
-                                        true
-                                    )
+                                it.contains(
+                                    filter,
+                                    true
+                                )
                         }
 
 
@@ -415,7 +550,9 @@ private fun AppUi() {
                         Modifier.fillMaxSize()
                     ) {
 
-                        items(visible) { link ->
+                        items(
+                            visible
+                        ) { link ->
 
                             Text(
                                 link,
